@@ -1,23 +1,35 @@
 package main
 
 import (
-	"context"
 	"cmp"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/half0wl/railtail/internal/config"
 	"github.com/half0wl/railtail/internal/logger"
 
+	"tailscale.com/client/local"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
+
+type pingOptions struct {
+	Target   netip.Addr
+	Interval time.Duration
+	Type     tailcfg.PingType
+	Size     int
+}
 
 func main() {
 	cfg, errs := config.LoadConfig()
@@ -48,15 +60,95 @@ func main() {
 		parseErrors = append(parseErrors, err)
 	}
 
+	pingTarget, err := parseIPSetting("TS_PING_TARGET", cfg.TSPingTarget)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	pingInterval, err := parseDurationSetting("TS_PING_INTERVAL", cfg.TSPingInterval)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	pingType, err := parsePingTypeSetting("TS_PING_TYPE", cfg.TSPingType)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	pingSize, err := parsePingSizeSetting("TS_PING_SIZE", cfg.TSPingSize)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	copyBufferSize, err := parseIntSetting("TS_COPY_BUFFER_SIZE", cfg.TSCopyBufferSize)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	readBufferBytes, err := parseIntSetting("TS_READ_BUFFER_BYTES", cfg.TSReadBufferBytes)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	writeBufferBytes, err := parseIntSetting("TS_WRITE_BUFFER_BYTES", cfg.TSWriteBufferBytes)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	keepAliveEnabled, err := parseBoolSetting("TS_KEEPALIVE", cfg.TSKeepAlive)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	keepAlivePeriod, err := parseDurationSetting("TS_KEEPALIVE_PERIOD", cfg.TSKeepAlivePeriod)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	noDelayEnabled, err := parseBoolSetting("TS_NO_DELAY", cfg.TSNoDelay)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	if pingInterval > 0 && !pingTarget.IsValid() {
+		parseErrors = append(parseErrors, fmt.Errorf("TS_PING_TARGET must be set when TS_PING_INTERVAL is enabled"))
+	}
+
+	if pingTarget.IsValid() && pingInterval <= 0 {
+		parseErrors = append(parseErrors, fmt.Errorf("TS_PING_INTERVAL must be a positive duration when TS_PING_TARGET is set"))
+	}
+
+	if copyBufferSize < 0 || readBufferBytes < 0 || writeBufferBytes < 0 {
+		parseErrors = append(parseErrors, fmt.Errorf("TS_COPY_BUFFER_SIZE, TS_READ_BUFFER_BYTES, and TS_WRITE_BUFFER_BYTES must be non-negative"))
+	}
+
 	if len(parseErrors) > 0 {
 		logger.StderrWithSource.Error("configuration error(s) found", logger.ErrorsAttr(parseErrors...))
 		os.Exit(1)
 	}
 
+	pingOptions := pingOptions{
+		Target:   pingTarget,
+		Interval: pingInterval,
+		Type:     pingType,
+		Size:     pingSize,
+	}
+
+	pingTargetValue := ""
+	if pingOptions.Target.IsValid() {
+		pingTargetValue = pingOptions.Target.String()
+	}
+
 	tcpOptions := tcpForwardOptions{
-		Diagnostics: diagnosticsEnabled,
-		DialTimeout: dialTimeout,
-		IOTimeout:   ioTimeout,
+		Diagnostics:      diagnosticsEnabled,
+		DialTimeout:      dialTimeout,
+		IOTimeout:        ioTimeout,
+		CopyBufferSize:   copyBufferSize,
+		ReadBufferBytes:  readBufferBytes,
+		WriteBufferBytes: writeBufferBytes,
+		KeepAlive:        keepAliveEnabled,
+		KeepAlivePeriod:  keepAlivePeriod,
+		NoDelay:          noDelayEnabled,
 	}
 
 	ts := &tsnet.Server{
@@ -86,8 +178,9 @@ func main() {
 
 	startPcapCapture(ts, cfg.TSPcapPath)
 	if diagnosticsEnabled {
-		logTailscaleStatus(ts)
+		logTailscaleStatus(ts, pingOptions.Target)
 	}
+	startPingLoop(ts, pingOptions)
 
 	listenAddr := "[::]:" + cfg.ListenPort
 
@@ -102,6 +195,16 @@ func main() {
 		slog.Duration("ts-dial-timeout", dialTimeout),
 		slog.Duration("ts-io-timeout", ioTimeout),
 		slog.String("ts-pcap-path", cfg.TSPcapPath),
+		slog.String("ts-ping-target", pingTargetValue),
+		slog.Duration("ts-ping-interval", pingOptions.Interval),
+		slog.String("ts-ping-type", string(pingOptions.Type)),
+		slog.Int("ts-ping-size", pingOptions.Size),
+		slog.Int("ts-copy-buffer-size", tcpOptions.CopyBufferSize),
+		slog.Int("ts-read-buffer-bytes", tcpOptions.ReadBufferBytes),
+		slog.Int("ts-write-buffer-bytes", tcpOptions.WriteBufferBytes),
+		slog.Bool("ts-keepalive", tcpOptions.KeepAlive),
+		slog.Duration("ts-keepalive-period", tcpOptions.KeepAlivePeriod),
+		slog.Bool("ts-no-delay", tcpOptions.NoDelay),
 	)
 
 	listener, err := net.Listen("tcp", listenAddr)
@@ -206,6 +309,56 @@ func parseDurationSetting(name, value string) (time.Duration, error) {
 	return parsed, nil
 }
 
+func parseIPSetting(name, value string) (netip.Addr, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return netip.Addr{}, nil
+	}
+
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("%s must be a valid IP address (got %q)", name, value)
+	}
+
+	return addr, nil
+}
+
+func parsePingTypeSetting(name, value string) (tailcfg.PingType, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return tailcfg.PingType("tsmp"), nil
+	}
+
+	switch value {
+	case "tsmp", "disco", "icmp", "peerapi":
+		return tailcfg.PingType(value), nil
+	default:
+		return "", fmt.Errorf("%s must be one of tsmp, disco, icmp, peerapi (got %q)", name, value)
+	}
+}
+
+func parsePingSizeSetting(name, value string) (int, error) {
+	return parseIntSetting(name, value)
+}
+
+func parseIntSetting(name, value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer (got %q)", name, value)
+	}
+
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer (got %q)", name, value)
+	}
+
+	return parsed, nil
+}
+
 func startPcapCapture(ts *tsnet.Server, pcapPath string) {
 	pcapPath = strings.TrimSpace(pcapPath)
 	if pcapPath == "" {
@@ -221,7 +374,72 @@ func startPcapCapture(ts *tsnet.Server, pcapPath string) {
 	}()
 }
 
-func logTailscaleStatus(ts *tsnet.Server) {
+func startPingLoop(ts *tsnet.Server, options pingOptions) {
+	if !options.Target.IsValid() || options.Interval <= 0 {
+		return
+	}
+
+	localClient, err := ts.LocalClient()
+	if err != nil {
+		logger.StderrWithSource.Error("failed to initialize tailscale ping client", logger.ErrAttr(err))
+		return
+	}
+
+	logger.Stdout.Info("starting tailscale ping loop",
+		slog.String("target", options.Target.String()),
+		slog.Duration("interval", options.Interval),
+		slog.String("ping-type", string(options.Type)),
+		slog.Int("ping-size", options.Size),
+	)
+
+	go func() {
+		ticker := time.NewTicker(options.Interval)
+		defer ticker.Stop()
+
+		for {
+			timeout := 10 * time.Second
+			if options.Interval > 0 && options.Interval < timeout {
+				timeout = options.Interval
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			result, err := localClient.PingWithOpts(ctx, options.Target, options.Type, local.PingOpts{Size: options.Size})
+			cancel()
+
+			if err != nil {
+				logger.StderrWithSource.Error("tailscale ping failed",
+					logger.ErrAttr(err),
+					slog.String("target", options.Target.String()),
+					slog.String("ping-type", string(options.Type)),
+				)
+			} else {
+				latency := time.Duration(result.LatencySeconds * float64(time.Second))
+				attrs := []any{
+					slog.String("target", options.Target.String()),
+					slog.String("node-ip", result.NodeIP),
+					slog.String("node-name", result.NodeName),
+					slog.Duration("latency", latency),
+					slog.String("endpoint", result.Endpoint),
+					slog.String("peer-relay", result.PeerRelay),
+					slog.Int("derp-region-id", result.DERPRegionID),
+					slog.String("derp-region-code", result.DERPRegionCode),
+					slog.String("ping-type", string(options.Type)),
+				}
+
+				if result.Err != "" {
+					attrs = append(attrs, slog.String("error", result.Err))
+					logger.StderrWithSource.Error("tailscale ping error", attrs...)
+				} else {
+					logger.Stdout.Info("tailscale ping", attrs...)
+				}
+			}
+
+			<-ticker.C
+		}
+	}()
+}
+
+func logTailscaleStatus(ts *tsnet.Server, pingTarget netip.Addr) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -272,4 +490,37 @@ func logTailscaleStatus(ts *tsnet.Server) {
 	if len(status.Health) > 0 {
 		logger.Stdout.Info("tailscale health", slog.Any("issues", status.Health))
 	}
+
+	if pingTarget.IsValid() {
+		logTargetPeerStatus(status, pingTarget)
+	}
+}
+
+func logTargetPeerStatus(status *ipnstate.Status, target netip.Addr) {
+	if status == nil {
+		return
+	}
+
+	for _, peer := range status.Peer {
+		for _, ip := range peer.TailscaleIPs {
+			if ip == target {
+				logger.Stdout.Info("tailscale peer status",
+					slog.String("target", target.String()),
+					slog.String("dns-name", strings.TrimSuffix(peer.DNSName, ".")),
+					slog.String("relay", peer.Relay),
+					slog.String("peer-relay", peer.PeerRelay),
+					slog.String("cur-addr", peer.CurAddr),
+					slog.Bool("active", peer.Active),
+					slog.Bool("online", peer.Online),
+					slog.Time("last-handshake", peer.LastHandshake),
+					slog.Time("last-write", peer.LastWrite),
+					slog.Int64("rx-bytes", peer.RxBytes),
+					slog.Int64("tx-bytes", peer.TxBytes),
+				)
+				return
+			}
+		}
+	}
+
+	logger.Stdout.Info("tailscale peer status not found", slog.String("target", target.String()))
 }
