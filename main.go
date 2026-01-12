@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"cmp"
 	"crypto/tls"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/half0wl/railtail/internal/config"
@@ -24,6 +26,39 @@ func main() {
 		os.Exit(1)
 	}
 
+	parseErrors := []error{}
+
+	diagnosticsEnabled, err := parseBoolSetting("TS_DIAGNOSTICS", cfg.TSDiagnostics)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	tsVerbose, err := parseBoolSetting("TS_VERBOSE", cfg.TSVerbose)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	dialTimeout, err := parseDurationSetting("TS_DIAL_TIMEOUT", cfg.TSDialTimeout)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	ioTimeout, err := parseDurationSetting("TS_IO_TIMEOUT", cfg.TSIOTimeout)
+	if err != nil {
+		parseErrors = append(parseErrors, err)
+	}
+
+	if len(parseErrors) > 0 {
+		logger.StderrWithSource.Error("configuration error(s) found", logger.ErrorsAttr(parseErrors...))
+		os.Exit(1)
+	}
+
+	tcpOptions := tcpForwardOptions{
+		Diagnostics: diagnosticsEnabled,
+		DialTimeout: dialTimeout,
+		IOTimeout:   ioTimeout,
+	}
+
 	ts := &tsnet.Server{
 		Hostname:     cfg.TSHostname,
 		AuthKey:      cfg.TSAuthKey,
@@ -35,12 +70,24 @@ func main() {
 		},
 		Dir: filepath.Join(cfg.TSStateDirPath, "railtail"),
 	}
+
+	if tsVerbose {
+		ts.Logf = func(format string, v ...any) {
+			logger.Stdout.Info("tsnet", slog.String("message", fmt.Sprintf(format, v...)))
+		}
+	}
+
 	if err := ts.Start(); err != nil {
 		logger.StderrWithSource.Error("failed to start tailscale network server", logger.ErrAttr(err))
 		os.Exit(1)
 	}
 
 	defer ts.Close()
+
+	startPcapCapture(ts, cfg.TSPcapPath)
+	if diagnosticsEnabled {
+		logTailscaleStatus(ts)
+	}
 
 	listenAddr := "[::]:" + cfg.ListenPort
 
@@ -50,6 +97,11 @@ func main() {
 		slog.String("target-addr", cfg.TargetAddr),
 		slog.String("ts-login-server", cmp.Or(cfg.TSLoginServer, "using_default")),
 		slog.String("ts-state-dir", filepath.Join(cfg.TSStateDirPath, "railtail")),
+		slog.Bool("ts-verbose", tsVerbose),
+		slog.Bool("ts-diagnostics", diagnosticsEnabled),
+		slog.Duration("ts-dial-timeout", dialTimeout),
+		slog.Duration("ts-io-timeout", ioTimeout),
+		slog.String("ts-pcap-path", cfg.TSPcapPath),
 	)
 
 	listener, err := net.Listen("tcp", listenAddr)
@@ -113,9 +165,111 @@ func main() {
 		logger.Stdout.Info("forwarding tcp connection", forwardingInfo...)
 
 		go func() {
-			if err := fwdTCP(conn, ts, cfg.TargetAddr); err != nil {
+			if err := fwdTCP(conn, ts, cfg.TargetAddr, tcpOptions); err != nil {
 				logger.StderrWithSource.Error("forwarding failed", append([]any{logger.ErrAttr(err)}, forwardingInfo...)...)
 			}
 		}()
+	}
+}
+
+func parseBoolSetting(name, value string) (bool, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return false, nil
+	}
+
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true, nil
+	case "0", "false", "no", "n", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean value (got %q)", name, value)
+	}
+}
+
+func parseDurationSetting(name, value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration (got %q)", name, value)
+	}
+
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s must be a positive duration (got %q)", name, value)
+	}
+
+	return parsed, nil
+}
+
+func startPcapCapture(ts *tsnet.Server, pcapPath string) {
+	pcapPath = strings.TrimSpace(pcapPath)
+	if pcapPath == "" {
+		return
+	}
+
+	logger.Stdout.Info("starting tailscale pcap capture", slog.String("pcap-path", pcapPath))
+
+	go func() {
+		if err := ts.CapturePcap(context.Background(), pcapPath); err != nil {
+			logger.StderrWithSource.Error("failed to start tailscale pcap capture", logger.ErrAttr(err), slog.String("pcap-path", pcapPath))
+		}
+	}()
+}
+
+func logTailscaleStatus(ts *tsnet.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	localClient, err := ts.LocalClient()
+	if err != nil {
+		logger.StderrWithSource.Error("failed to initialize tailscale local client", logger.ErrAttr(err))
+		return
+	}
+
+	status, err := localClient.Status(ctx)
+	if err != nil {
+		logger.StderrWithSource.Error("failed to read tailscale status", logger.ErrAttr(err))
+		return
+	}
+
+	tailscaleIPs := make([]string, 0, len(status.TailscaleIPs))
+	for _, ip := range status.TailscaleIPs {
+		tailscaleIPs = append(tailscaleIPs, ip.String())
+	}
+
+	selfDNS := ""
+	selfRelay := ""
+	selfPeerRelay := ""
+	selfCurAddr := ""
+	if status.Self != nil {
+		selfDNS = strings.TrimSuffix(status.Self.DNSName, ".")
+		selfRelay = status.Self.Relay
+		selfPeerRelay = status.Self.PeerRelay
+		selfCurAddr = status.Self.CurAddr
+	}
+
+	magicDNSSuffix := ""
+	if status.CurrentTailnet != nil {
+		magicDNSSuffix = status.CurrentTailnet.MagicDNSSuffix
+	}
+
+	logger.Stdout.Info("tailscale status",
+		slog.Bool("kernel-tun", status.TUN),
+		slog.String("backend-state", status.BackendState),
+		slog.String("self-dns", selfDNS),
+		slog.String("self-relay", selfRelay),
+		slog.String("self-peer-relay", selfPeerRelay),
+		slog.String("self-cur-addr", selfCurAddr),
+		slog.String("tailscale-ips", strings.Join(tailscaleIPs, ", ")),
+		slog.String("magic-dns-suffix", magicDNSSuffix),
+	)
+
+	if len(status.Health) > 0 {
+		logger.Stdout.Info("tailscale health", slog.Any("issues", status.Health))
 	}
 }

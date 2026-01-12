@@ -31,6 +31,11 @@ type Config struct {
 	TSLoginServer  string `flag:"ts-login-server" env:"TS_LOGIN_SERVER" default:"" usage:"base url of the control server, If you are using Headscale for your control server, use your Headscale instance's URL"`
 	TSStateDirPath string `flag:"ts-state-dir" env:"TS_STATEDIR_PATH" default:"/tmp/railtail" usage:"tailscale state dir"`
 	TSAuthKey      string `env:"TS_AUTHKEY,TS_AUTH_KEY" usage:"tailscale auth key"`
+	TSVerbose      string `flag:"ts-verbose" env:"TS_VERBOSE" default:"false" usage:"enable verbose tailscale logs"`
+	TSDiagnostics  string `flag:"ts-diagnostics" env:"TS_DIAGNOSTICS" default:"false" usage:"enable diagnostic logging"`
+	TSPcapPath     string `flag:"ts-pcap-path" env:"TS_PCAP_PATH" default:"" usage:"write tsnet packet capture to path"`
+	TSDialTimeout  string `flag:"ts-dial-timeout" env:"TS_DIAL_TIMEOUT" default:"0s" usage:"timeout for tailscale dial (duration, e.g. 10s)"`
+	TSIOTimeout    string `flag:"ts-io-timeout" env:"TS_IO_TIMEOUT" default:"0s" usage:"timeout for read/write inactivity (duration, e.g. 30s)"`
 
 	ForwardTrafficType ForwardTrafficType
 }
