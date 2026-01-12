@@ -1,6 +1,6 @@
 module github.com/half0wl/railtail
 
-go 1.23.4
+go 1.25.5
 
 require (
 	golang.org/x/sync v0.9.0
