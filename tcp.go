@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"time"
 
 	"github.com/half0wl/railtail/internal/logger"
@@ -146,6 +147,20 @@ func fwdTCP(lstConn net.Conn, ts *tsnet.Server, targetAddr string, options tcpFo
 }
 
 func applyTCPOptions(conn net.Conn, options tcpForwardOptions, label string, connInfo []any) {
+	inner := unwrapConn(conn)
+	if inner == nil {
+		return
+	}
+
+	if inner != conn && options.Diagnostics {
+		logger.Stdout.Info("using unwrapped connection",
+			append([]any{slog.String("side", label), slog.String("conn-type", fmt.Sprintf("%T", conn)), slog.String("inner-type", fmt.Sprintf("%T", inner))}, connInfo...)...)
+	}
+
+	applyTCPOptionsToConn(inner, options, label, connInfo)
+}
+
+func applyTCPOptionsToConn(conn net.Conn, options tcpForwardOptions, label string, connInfo []any) {
 	if options.ReadBufferBytes > 0 {
 		if setter, ok := conn.(readBufferSetter); ok {
 			if err := setter.SetReadBuffer(options.ReadBufferBytes); err != nil && options.Diagnostics {
@@ -200,6 +215,31 @@ func applyTCPOptions(conn net.Conn, options tcpForwardOptions, label string, con
 			logger.Stdout.Info("keepalive period not supported", append([]any{slog.String("side", label)}, connInfo...)...)
 		}
 	}
+}
+
+func unwrapConn(conn net.Conn) net.Conn {
+	if conn == nil {
+		return nil
+	}
+
+	if inner, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+		return inner.Unwrap()
+	}
+
+	value := reflect.ValueOf(conn)
+	for value.Kind() == reflect.Pointer {
+		value = value.Elem()
+	}
+	if value.IsValid() && value.Kind() == reflect.Struct {
+		field := value.FieldByName("Conn")
+		if field.IsValid() && field.CanInterface() {
+			if inner, ok := field.Interface().(net.Conn); ok {
+				return inner
+			}
+		}
+	}
+
+	return conn
 }
 
 func copyWithStats(dst net.Conn, src net.Conn, timeout time.Duration, bufferSize int, stats *transferStats) error {
